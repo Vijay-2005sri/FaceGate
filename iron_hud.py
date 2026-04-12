@@ -36,6 +36,7 @@ VK_ESCAPE = 0x1B
 VK_F4 = 0x73
 VK_LWIN = 0x5B
 VK_RWIN = 0x5C
+VK_Q = 0x51
 
 LLKHF_ALTDOWN = 0x20
 
@@ -60,9 +61,10 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
 
 _hook_handle = None
 _hook_active = True
+_terminate_requested = False
 
 def _keyboard_hook_proc(nCode, wParam, lParam):
-    global _hook_active
+    global _hook_active, _terminate_requested
     if not _hook_active:
         return user32.CallNextHookEx(_hook_handle, nCode, wParam, lParam)
 
@@ -70,6 +72,13 @@ def _keyboard_hook_proc(nCode, wParam, lParam):
         kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
         vk = kb.vkCode
         alt_down = kb.flags & LLKHF_ALTDOWN
+
+        # ✅ Ctrl+Shift+Q = Termination key (bypasses all blocks)
+        ctrl_down = user32.GetAsyncKeyState(0x11) & 0x8000
+        shift_down = user32.GetAsyncKeyState(0x10) & 0x8000
+        if vk == VK_Q and ctrl_down and shift_down:
+            _terminate_requested = True
+            return user32.CallNextHookEx(_hook_handle, nCode, wParam, lParam)
 
         # Block Win keys
         if vk in (VK_LWIN, VK_RWIN):
@@ -183,6 +192,11 @@ class IronHUD(QMainWindow):
         self.focus_timer = QTimer(self)
         self.focus_timer.timeout.connect(self._force_focus)
         self.focus_timer.start(500)
+
+        # ✅ Poll for Ctrl+Shift+Q termination request
+        self.kill_timer = QTimer(self)
+        self.kill_timer.timeout.connect(self._check_terminate)
+        self.kill_timer.start(200)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_frame)
@@ -450,25 +464,43 @@ class IronHUD(QMainWindow):
         painter.setFont(QFont("Consolas",18))
         painter.drawText(50,self.height()-70,f"STATUS : {self.state}")
 
-    # 🔒 Block keyboard
+    # 🔒 Block keyboard (except Ctrl+Shift+Q termination)
     def keyPressEvent(self, event):
+        if (event.modifiers() == (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+                and event.key() == Qt.Key.Key_Q):
+            self._force_terminate()
+            return
+        # Block everything else
         pass
 
-    # 🔒 Prevent closing unless unlocked
-    def closeEvent(self,event):
+    def _check_terminate(self):
+        """Poll the global termination flag set by Ctrl+Shift+Q."""
+        global _terminate_requested
+        if _terminate_requested:
+            _terminate_requested = False
+            self._force_terminate()
 
-        if self.state != "ACCESS GRANTED":
+    def _force_terminate(self):
+        """Force-close the app, bypassing the access-granted check."""
+        self.state = "TERMINATED"  # Allow closeEvent to proceed
+        self.close()
+
+    # 🔒 Prevent closing unless unlocked or force-terminated
+    def closeEvent(self, event):
+
+        if self.state not in ("ACCESS GRANTED", "TERMINATED"):
             event.ignore()
             return
 
-        # 🔓 Unhook keyboard and stop focus grabbing
+        # 🔓 Unhook keyboard and stop all timers
         uninstall_keyboard_hook()
         self.focus_timer.stop()
+        self.kill_timer.stop()
 
         if self.cap:
             self.cap.release()
 
-        self.recognition_thread.running=False
+        self.recognition_thread.running = False
         self.recognition_thread.quit()
         self.recognition_thread.wait()
 
